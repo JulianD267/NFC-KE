@@ -1,0 +1,395 @@
+#include "ECCSigner.h"
+
+ECCSigner::ECCSigner(){
+
+}
+String ECCSigner::getPubkey(){
+    return publickey;
+}
+static int myrand( void *rng_state, unsigned char *output, size_t len )
+{
+    size_t use_len;
+    int rnd;
+    if( rng_state != NULL )
+        rng_state  = NULL;
+
+    while( len > 0 )
+    {
+        use_len = len;
+        if( use_len > sizeof(int) )
+            use_len = sizeof(int);
+
+        rnd = esp_random();
+        memcpy( output, &rnd, use_len );
+        output += use_len;
+        len -= use_len;
+    }
+
+    return( 0 );
+}
+void ECCSigner::begin(){
+
+    if(!SPIFFS.begin(false)){
+      DEBUG_STDERR("SPIFFS FAILED");
+      return;
+    }
+
+    // Initialize the ecdsa context
+    mbedtls_ecdsa_init(&this->ecdsa);
+    
+    // Generate a brand new Keypair
+    if(mbedtls_ecdsa_genkey(&this->ecdsa,MBEDTLS_ECP_DP_SECP256R1, myrand, NULL) != 0){
+      DEBUG_STDERR("NO KEY GENERATED");
+    };
+    
+    // Export the public key
+    mbedtls_pk_context pk;
+    mbedtls_pk_init(&pk);
+    if(mbedtls_pk_setup(&pk, mbedtls_pk_info_from_type(MBEDTLS_PK_ECKEY)) != 0){
+      DEBUG_STDERR("SETUP FAILED FOR KEY");
+    };
+
+    // Set the context to the ecdsa object
+    pk.pk_ctx = &this->ecdsa;    
+
+    // Write to PEM and attribute string
+    byte key[200];    // 178 should be enough though. The 0x0 Terminator will wirk with the String
+    if(mbedtls_pk_write_pubkey_pem(&pk, key, 200) != 0){
+      DEBUG_STDERR("PEM FAILED WITH CODE");
+    };
+
+    String pkey((char*)key);
+    publickey = pkey;
+    DEBUG_STDSUC("PUBKEY:");
+    DEBUG_STDSUC(publickey.c_str());
+    
+    // Cleanup
+    //mbedtls_pk_free(&pk);
+}
+
+int ECCSigner::deriveEncryptedPubkey(byte* ct_dst, size_t* ct_len_dst, byte* sig_dst, size_t* sig_len_dst){
+    File passw = SPIFFS.open(PASS_FILE);
+    if(!passw){
+      DEBUG_STDERR("Failed to open PASSW");
+      return -1;
+    }
+    
+    String pass = passw.readString();
+    passw.close();
+
+    // Generate Password and salt for symmetric encryption
+    // Pass.bin = |password[64] + salt[16]|
+    byte password[PASSLEN];
+    byte salt[SALTLEN];
+    byte concatPW[PASSLEN+SALTLEN+1]; // Needs to be one element longer. Last element will be the 0 Termination of the string
+
+    // Stupid getBytes behaviour. Solution:
+    // https://forum.arduino.cc/index.php?topic=126834.0
+    pass.getBytes(concatPW, PASSLEN + SALTLEN +1);    // Yeah this is weird.. getBytes behaves a little odd. Make it one Byte longer so 0x0 fits into it.
+    pass = "";  // Reset the pass String
+
+
+    memcpy(password, concatPW, PASSLEN);
+    memcpy(salt, concatPW+PASSLEN, SALTLEN);
+    //Reset
+    memset(concatPW, 0x0, PASSLEN + SALTLEN +1);   
+
+    // Derive Password using PBKDF2_HMAC
+    mbedtls_md_context_t sha256_ctx;
+    mbedtls_md_context_t sha1_ctx;
+    mbedtls_md_init(&sha256_ctx);
+    mbedtls_md_init(&sha1_ctx);
+                                                                                // Use HMAC
+    if(mbedtls_md_setup(&sha256_ctx, mbedtls_md_info_from_type(MBEDTLS_MD_SHA256), USE_HMAC) != 0){
+      DEBUG_STDERR("MD256 setup Failed");
+      return 1;
+    }
+    if(mbedtls_md_setup(&sha1_ctx, mbedtls_md_info_from_type(MBEDTLS_MD_SHA1), USE_HMAC) != 0){
+      DEBUG_STDERR("MD1 setup Failed");
+      return 1;
+    }
+
+    byte kdf_key[KEYLEN];
+    byte kdf_iv[IVLEN];     // IV length set to 12.. optimal i guess
+    if(mbedtls_pkcs5_pbkdf2_hmac(&sha256_ctx, password, PASSLEN, salt, SALTLEN, ITERATIONS, KEYLEN, kdf_key) != 0){
+      DEBUG_STDERR("PW Gen failed");
+      return 1;
+    }
+    
+    if(mbedtls_pkcs5_pbkdf2_hmac(&sha1_ctx, password, PASSLEN, salt, SALTLEN, ITERATIONS, IVLEN, kdf_iv) != 0){
+      DEBUG_STDERR("IV Gen failed");
+      return 1;
+    }
+    memset(password, 0x0, PASSLEN);
+    memset(salt, 0x0, SALTLEN);
+    mbedtls_md_free(&sha1_ctx);
+    mbedtls_md_free(&sha256_ctx);
+
+    // AES GCM Encryption for Pubkey. GCM Mode produces the same ciphertext length as the plaintext length!
+    size_t pk_len = publickey.length();
+    byte ciphertext[pk_len];
+    byte tag[16];
+    mbedtls_gcm_context aes;
+    mbedtls_gcm_init(&aes);                                     // BITS, WHY?!
+    if(mbedtls_gcm_setkey(&aes, MBEDTLS_CIPHER_ID_AES, kdf_key, KEYLEN*8) != 0){
+      DEBUG_STDERR("GCM setkey failed");
+      return 2;
+    };                                                                // The id is Additional Data, complying to the protocol
+    if(mbedtls_gcm_starts(&aes,MBEDTLS_GCM_ENCRYPT, kdf_iv, IVLEN, (byte*)MYID, strlen(MYID)) != 0){
+      DEBUG_STDERR("GCM Start failed");
+      return 2;
+    };              // Update, feed the stream and the ciphertext
+    if(mbedtls_gcm_update(&aes, publickey.length(), (byte*) publickey.c_str(), ciphertext) != 0){
+      DEBUG_STDERR("GCM Update failed");
+      return 2;
+    };              // Finish, produce the Authenticity Tag. Tag Length is ALWAYS 16 bytes!
+    if(mbedtls_gcm_finish(&aes, tag, 16)){
+      DEBUG_STDERR("GCM Finish failed");
+      return 2;
+    };
+    mbedtls_gcm_free(&aes);
+
+    // Kill the key
+    memset(kdf_iv, 0x0, IVLEN);
+    memset(kdf_key, 0x0, KEYLEN);
+
+    // Concat Tag and Ciphertext
+    byte ciphertag[pk_len+16];
+    memcpy(ciphertag, ciphertext, pk_len);
+    memcpy(ciphertag+pk_len, tag, 16);
+    
+    // Encode the Ciphertext
+    if(mbedtls_base64_encode(ct_dst, BASE64_LEN(pk_len+16), ct_len_dst, ciphertag, pk_len+16)){
+      DEBUG_STDERR("Buffer too small for Base64 encoding!");
+      return 3;
+    };
+
+    // Sign the encoded ciphertext using my own key buffer
+    if(sign_b64(ct_dst, *ct_len_dst, sig_dst, BASE64_LEN(SIGNATURE_LEN), sig_len_dst) != 0){
+      DEBUG_STDERR("Signature of Ct failed");
+      return 3;
+    }; 
+    return 0;
+}
+
+
+ECCSigner::~ECCSigner(){
+  mbedtls_ecdsa_free(&ecdsa);
+ //mbedtls_pk_free(&pk);
+}
+
+/*
+Just a helper to print a hex number, mainly for Debugging
+*/
+void ECCSigner::printHex(byte num) {
+  char hexCar[3];
+  snprintf(hexCar, 3, "%02X ", num);
+  Serial.print(hexCar);
+}
+
+/*
+A cleanup function to erase all precomputed points within an ec group
+*/
+void ECCSigner::ecp_clear_precomputed( mbedtls_ecp_group *grp )
+{
+    if( grp->T != NULL )
+    {
+        size_t i;
+        for( i = 0; i < grp->T_size; i++ )
+            mbedtls_ecp_point_free( &grp->T[i] );
+        free( grp->T );
+    }
+    grp->T = NULL;
+    grp->T_size = 0;
+}
+
+/*
+The main signing function. It takes the following inputs:
+byte* message     -     Message buffer
+size_t msg_len    -     length of the message buffer
+byte* signature   -     Destination buffer for the signature, must not be null
+size_t* sig_bytes -     Location to write the signature length to
+The function itself will perform an ECDSA signature. First it will open the private key file from SPIFFS. 
+Using this key, it will attempt to generate an ECP key from that, which gets used for the signing operation.
+Oddly enough, mbedtls will not hash the message for us! This is something we need to do manually in the next 
+step.
+Finally the signature can be written to the buffer
+Return:
+0  - Success
+-1 - File error
+1  - ECDSA error
+*/
+int ECCSigner::sign(byte* message, size_t msg_len, byte* signature, size_t* sig_bytes){
+  
+  // Sanity check
+  if(!message || !signature || !sig_bytes ){
+    DEBUG_STDERR("message/signature/signature length must not be null");
+    return -1;
+  }
+  // Create a ECDSA context
+  // mbedtls_ecdsa_context ecdsa;
+  // mbedtls_ecdsa_init(&ecdsa);
+
+  // Load Private Key from SPIFFS
+  // mbedtls_pk_context pk;
+  // mbedtls_pk_init(&pk);  
+  // File sk = SPIFFS.open(PRIVKEY_FILE);
+  // if(!sk){
+  //   DEBUG_STDERR("Load Private Key failed");
+  //   return -1;
+  // }
+  // String privatekey = sk.readString();
+  // sk.close();
+  //                                                 // Length must account for 0 byte at the end! +1
+  // if(mbedtls_pk_parse_key(&pk, (byte*) privatekey.c_str(), privatekey.length()+1 /*strlen(privkey)+1*/, NULL, 0) != 0){
+  //   DEBUG_STDERR("Parse key failed");
+  //   return -1;
+  // }
+  // privatekey = "";    // Don't use .clear() here! It will only reset the length but NOT overwrite the buffer!
+  // if( mbedtls_pk_get_type( &pk ) == MBEDTLS_PK_ECKEY ){
+  //   // We got an EC key! Lets create a keypair from that
+  //   mbedtls_ecp_keypair *ecp = mbedtls_pk_ec(pk);    
+  //   if(mbedtls_ecdsa_from_keypair(&ecdsa, ecp) != 0){
+  //     DEBUG_STDERR("ECDSA from key failed");
+  //     return 1;
+  //   }
+
+    // Now that's a bit odd. We have to first hash the Message, as the ECDSA routine of mbedtls does
+    // not do that for us... No problem then. Use SHA256, 32 Byte hash
+    byte hash_msg[HASHLEN];
+    if(HASH(message, msg_len, hash_msg, NOT_USE_HMAC) !=0){
+      DEBUG_STDERR("Hash of Message failed");
+      return 1;
+    };
+
+    // Write the signature
+    if(mbedtls_ecdsa_write_signature(&ecdsa, HASHTYPE, hash_msg, HASHLEN, signature, sig_bytes, myrand, NULL) != 0){
+      DEBUG_STDERR("Write Signature failed");
+      return 1;
+    }
+
+    // Cleanup
+    ecp_clear_precomputed(&ecdsa.grp);
+    // mbedtls_ecp_keypair_free(ecp);
+    // mbedtls_pk_free(&pk);  
+    // mbedtls_ecdsa_free(&ecdsa);
+    
+  //  }
+  DEBUG_STDSUC("Signing complete");
+  return 0;
+}
+
+/*
+Just a wrapper function to produce a Base64 encoded signature. Takes basically the same inputs as sign()
+Return
+0 - Success
+1 - Signature error
+2 - Base64 error
+*/
+int ECCSigner::sign_b64(byte* message, size_t msg_len, byte* b64_sig_buf, size_t b64_sig_bytes, size_t* bytes_written){
+    
+    // Sanity Check
+    if(!message || !b64_sig_buf || !bytes_written){
+      DEBUG_STDERR("message/signature buffer/bytes written must not be null");
+      return 1;
+    }
+    if(b64_sig_bytes < BASE64_LEN(SIGNATURE_LEN)){
+      DEBUG_STDERR("Base64 Buffer too small");
+      return 1;
+    }
+
+    byte signature[SIGNATURE_LEN];   // 72 is the standard Signature length with ECDSA SECP256R1 256 Bit key. Might be smaller though! pay attention
+    size_t sig_bytes_written;
+    if(sign(message, msg_len, signature, &sig_bytes_written) != 0){
+      DEBUG_STDERR("Signature of pkey failed");
+      return 1;
+    }
+    // Great now we have a signature. Lets encode it in Base64, so that we can send it!
+    if(mbedtls_base64_encode(b64_sig_buf, b64_sig_bytes, bytes_written, signature, sig_bytes_written) == MBEDTLS_ERR_BASE64_BUFFER_TOO_SMALL){
+      DEBUG_STDERR("Buffer too small for Base64 encoding!");
+      return 2;
+    }
+    return 0;
+}
+
+int ECCSigner::verify(byte* message, size_t msg_len, byte* signature, size_t sig_len, byte* publickey, size_t keylen){
+  // Sanity check
+  if(!message || !signature ){
+    DEBUG_STDERR("message/signature must not be null");
+    return -1;
+  }
+
+  // Create a ECDSA context
+  mbedtls_ecdsa_context ecdsa;
+  mbedtls_ecdsa_init(&ecdsa);
+
+  // Load Private Key from SPIFFS
+  mbedtls_pk_context pk;
+  mbedtls_pk_init(&pk); 
+                                                  // Length must account for 0 byte at the end! +1
+  if(mbedtls_pk_parse_public_key(&pk, publickey, keylen+1 /*strlen(privkey)+1*/) != 0){
+    DEBUG_STDERR("Parse publickey failed");
+    return -1;
+  }
+  
+  if( mbedtls_pk_get_type( &pk ) == MBEDTLS_PK_ECKEY ){
+    // We got an EC key! Lets create a keypair from that
+    mbedtls_ecp_keypair *ecp = mbedtls_pk_ec(pk);    
+    if(mbedtls_ecdsa_from_keypair(&ecdsa, ecp) != 0){
+      DEBUG_STDERR("ECDSA from key failed");
+      return 1;
+    }
+
+    // Now that's a bit odd. We have to first hash the Message, as the ECDSA routine of mbedtls does
+    // not do that for us... No problem then. Use SHA256, 32 Byte hash
+    byte hash_msg[HASHLEN];
+    if(HASH(message, msg_len, hash_msg, NOT_USE_HMAC) !=0){
+      DEBUG_STDERR("Hash of Message failed");
+      return 1;
+    };
+
+    // Write the signature
+    if(mbedtls_ecdsa_read_signature(&ecdsa, hash_msg, HASHLEN, signature, sig_len) != 0){
+      DEBUG_STDERR("Signature failed");
+      return 1;
+    }
+    DEBUG_STDSUC("SIGNATURE OK");
+
+    // Cleanup
+    ecp_clear_precomputed(&ecdsa.grp);
+    mbedtls_ecp_keypair_free(ecp);
+    mbedtls_pk_free(&pk);  
+    mbedtls_ecdsa_free(&ecdsa);
+    
+  }
+  DEBUG_STDSUC("Verification complete");
+  return 0;
+}
+
+int ECCSigner::verify_b64(String message, String b64_signature, String publickey){
+      // Sanity Check
+    if(!message || !b64_signature || !publickey){
+      DEBUG_STDERR("message/signature buffer/publickey written must not be null");
+      return 1;
+    }
+
+    byte signature[SIGNATURE_LEN];   // 72 is the standard Signature length with ECDSA SECP256R1 256 Bit key. Might be smaller though! pay attention
+    size_t sig_bytes_written;
+    if(mbedtls_base64_decode(signature, SIGNATURE_LEN, &sig_bytes_written, (byte*)b64_signature.c_str(), b64_signature.length()) !=0){
+      DEBUG_STDERR("Base64 decoding of signature failed");
+      return 2;
+    };
+    
+    byte byte_message[message.length()+1];    // Must be one place longer
+    message.getBytes(byte_message, message.length()+1);
+
+    byte pubkey_bytes[publickey.length()+1];
+    publickey.getBytes(pubkey_bytes, publickey.length()+1);
+
+    if(verify(byte_message, message.length(), signature, sig_bytes_written, pubkey_bytes, publickey.length()) != 0){
+      return 1;
+    }
+    
+  return 0;
+}
+
