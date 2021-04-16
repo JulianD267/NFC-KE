@@ -20,7 +20,7 @@ The latter two libraries are necessary for our demonstrator which makes use of a
 
 You may refer to the wiring diagram below:
 
-![ESP](https://github.com/JulianD267/ecc-sign-ossl/blob/master/img/esp32_wiring.png?raw=true)
+![ESP](https://github.com/JulianD267/NFC-KE/raw/master/img/esp32_wiring.png)
 
 ## Components
 There exist two basic components for this ESP32 software
