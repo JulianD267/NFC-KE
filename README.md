@@ -7,12 +7,12 @@ This project aims to offer a scalable solution for signing and verifying sensor 
 Fundamentally, this system revolves around one central Raspberry Pi model 3B+ and the [TPM 2.0](https://www.infineon.com/cms/de/product/evaluation-boards/iridium-sli-9670-tpm2.0/)
 module from Infineon. It is considered to be the signing hub. All other sensor nodes will send their data to this Raspberry Pi. The Pi will then verify the data and sign it, using a TPM generated key. The wiring diagram for the signing hub is shown below:
 
-![RPI](https://github.com/JulianD267/NFC-KE.git/blob/master/img/rpi_wiring.png?raw=true)
+![RPI](https://github.com/JulianD267/NFC-KE/tree/master/img/rpi_wiring.png?raw=true)
 
 ### ESP32
 The other component will be an ESP32 development board [Heltec LoRa 32 v2](https://heltec.org/project/wifi-lora-32/). It offers an integrated OLED display and LoRa capabilities. For a practical example, a DHT22 temperature sensor is attatched to the ESP32, to get some real world measurements. For further information regarding the ESP32 setup, refer to the code/readme within the ```/ESPSign``` directory The wiring diagram for the ESP32 is shown below:
 
-![ESP](https://github.com/JulianD267/NFC-KE.git/blob/master/img/esp32_wiring.png?raw=true)
+![ESP](https://github.com/JulianD267/NFC-KE/tree/master/img/esp32_wiring.png?raw=true)
 
 ### NFC
 For reasons discussed further down, the Sensors and the signing hub make use of an NFC authorization challenge-response scheme to enhance the data security. Therefore, a commonly used NFC reader is used, which uses the [PN532](https://www.nxp.com/docs/en/nxp/data-sheets/PN532_C1.pdf) reader IC and a [MIFARE Classic 1k](https://www.nxp.com/products/rfid-nfc/mifare-hf/mifare-classic/mifare-classic-ev1-1k-4k:MF1S50YYX_V1) NFC tag. In this particular example, the following [Evaluationboard](https://www.bastelgarage.ch/pn532-nfc-rfid-modul-v3-set-mit-rfid-karte-und-key) was used (offers I2C, SPI and UART). Particularly, we used the UART interface with this [library](https://github.com/Seeed-Studio/PN532). For the Raspberry, there exists a rather neat library called ["libnfc"](https://github.com/nfc-tools/libnfc) which is open source and platform independent. This enables any usual Linux device to run this as well.
